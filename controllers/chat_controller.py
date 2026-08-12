@@ -1,99 +1,373 @@
 from flask import request, jsonify
+
 from database import get_connection
+
 from services.chunk_service import get_context
 from services.embedding_service import create_question_embedding
 from services.vector_service import search_documents
-from services.chunk_service import get_context
-from services.llm_service import ask_question_to_ollama, build_prompt, ask_question_to_groq
+from services.llm_service import (
+    ask_question_to_ollama,
+    build_prompt
+)
+
+
+# =========================================================
+# START CHAT
+# =========================================================
 
 def start_chat():
-    data = request.get_json()
+
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Invalid JSON"
+        }), 400
+
     userid = data.get("userid")
     title = data.get("title")
-    sql = "INSERT INTO chats(userid, title) "
-    sql += "VALUES('" + str(userid) + "', '" + title + "')"
-    conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute(sql)
-    chat_id = cursor.lastrowid
-    conn.commit()
-    cursor.close()
-    conn.close()
 
-    return jsonify({
-        "success": True,
-        "message": "Chat started successfully.",
-        "chat_id": chat_id,
-        "title": title
-    }), 201
+    if not userid or not title:
+        return jsonify({
+            "success": False,
+            "message": "userid and title required"
+        }), 400
 
-def ask_question(): 
-    data = request.get_json()
-    chatid = data.get("chatid")
-    userid = data.get("userid")
+    conn = None
+    cursor = None
+
+    try:
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        sql = """
+        INSERT INTO chats (userid, title)
+        VALUES (%s, %s)
+        """
+
+        cursor.execute(
+            sql,
+            (userid, title)
+        )
+
+        conn.commit()
+
+        chat_id = cursor.lastrowid
+
+        return jsonify({
+            "success": True,
+            "message": "Chat started successfully",
+            "chat_id": chat_id
+        }), 201
+
+    except Exception as e:
+
+        if conn:
+            conn.rollback()
+
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
+
+    finally:
+
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
+
+
+# =========================================================
+# ASK QUESTION
+# =========================================================
+
+def ask_question():
+
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Invalid JSON"
+        }), 400
+
     question = data.get("question")
+    chat_id = data.get("chat_id")
 
-    #1. Create embedding for the question
-    embeddings = create_question_embedding(question)
-    #2. Search for relevant documents in the vector database
-    documents = search_documents(embeddings)
-    #3. Get context from the retrieved documents
-    context = get_context(documents)
+    if not question:
+        return jsonify({
+            "success": False,
+            "message": "Question required"
+        }), 400
 
-    #4. Get history for chat and build prompt
-    message_history = chat_history(chatid)
+    conn = None
+    cursor = None
 
-    prompt = build_prompt(question, context)
-    #answer = ask_question_to_ollama(prompt, message_history)
-    answer = ask_question_to_groq(prompt, message_history)
+    try:
 
-    sql = "INSERT INTO chat_messages(chatid, message_by, message) "
-    sql += "VALUES(" + str(chatid) + ", 'user', '" + question.replace("'", "''") + "'), "
-    sql += "(" + str(chatid) + ", 'llm', '" + answer.replace("'", "''") + "') "
-    conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute(sql)
-    conn.commit()
-    cursor.close()
-    conn.close()
+        # -------------------------------------------------
+        # 1. Create Question Embedding
+        # -------------------------------------------------
 
-    return jsonify({
-        "success": True,
-        "answer": answer
-    }), 201
+        question_embedding = create_question_embedding(
+            question
+        )
 
-def chat_messages():
-    data = request.get_json()
-    chatid = data.get("chatid")
-    messages = chat_history(chatid)
+        # -------------------------------------------------
+        # 2. Search Similar Documents
+        # -------------------------------------------------
 
-    return jsonify({
-        "success": True,
-        "messages": messages
-    }), 201
+        documents = search_documents(
+            question_embedding
+        )
+
+        # -------------------------------------------------
+        # 3. Extract Context
+        # -------------------------------------------------
+
+        context = get_context(
+            documents
+        )
+
+        # -------------------------------------------------
+        # 4. Build Prompt
+        # -------------------------------------------------
+
+        prompt = build_prompt(
+            context,
+            question
+        )
+
+        # -------------------------------------------------
+        # 5. Ask Ollama
+        # -------------------------------------------------
+
+        answer = ask_question_to_ollama(
+            prompt
+        )
+
+        # -------------------------------------------------
+        # 6. Save Chat Message
+        # -------------------------------------------------
+
+        if chat_id:
+
+            conn = get_connection()
+            cursor = conn.cursor()
+
+            sql = """
+            INSERT INTO chat_messages
+            (
+                chat_id,
+                question,
+                answer
+            )
+            VALUES
+            (
+                %s,
+                %s,
+                %s
+            )
+            """
+
+            cursor.execute(
+                sql,
+                (
+                    chat_id,
+                    question,
+                    answer
+                )
+            )
+
+            conn.commit()
+
+        # -------------------------------------------------
+        # 7. Return Answer
+        # -------------------------------------------------
+
+        return jsonify({
+            "success": True,
+            "answer": answer
+        }), 200
+
+    except Exception as e:
+
+        if conn:
+            conn.rollback()
+
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
+
+    finally:
+
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
+
+
+# =========================================================
+# CHAT LIST
+# =========================================================
 
 def chat_list():
-    data = request.get_json()
+
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Invalid JSON"
+        }), 400
+
     userid = data.get("userid")
-    sql = "SELECT * FROM chats WHERE userid = " + str(userid) + " ORDER BY id DESC"
-    conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute(sql)
-    chats = cursor.fetchall()
-    cursor.close()
-    conn.close()
 
-    return jsonify({
-        "success": True,
-        "chats": chats
-    }), 201
+    if not userid:
+        return jsonify({
+            "success": False,
+            "message": "userid required"
+        }), 400
 
-def chat_history(chatid):
-    conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-    sql = "SELECT * FROM chat_messages WHERE chatid = " + str(chatid) + " ORDER BY id"
-    cursor.execute(sql)
-    messages = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return messages
+    conn = None
+    cursor = None
+
+    try:
+
+        conn = get_connection()
+
+        cursor = conn.cursor(
+            dictionary=True
+        )
+
+        sql = """
+        SELECT
+            id,
+            userid,
+            title,
+            created_at
+        FROM chats
+        WHERE userid = %s
+        ORDER BY id DESC
+        """
+
+        cursor.execute(
+            sql,
+            (userid,)
+        )
+
+        chats = cursor.fetchall()
+
+        return jsonify({
+            "success": True,
+            "chats": chats
+        }), 200
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
+
+    finally:
+
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
+
+
+# =========================================================
+# CHAT MESSAGES
+# =========================================================
+
+def chat_messages():
+
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Invalid JSON"
+        }), 400
+
+    chat_id = data.get("chat_id")
+
+    if not chat_id:
+        return jsonify({
+            "success": False,
+            "message": "chat_id required"
+        }), 400
+
+    try:
+
+        messages = chat_history(
+            chat_id
+        )
+
+        return jsonify({
+            "success": True,
+            "messages": messages
+        }), 200
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
+
+
+# =========================================================
+# CHAT HISTORY
+# =========================================================
+
+def chat_history(chat_id):
+
+    conn = None
+    cursor = None
+
+    try:
+
+        conn = get_connection()
+
+        cursor = conn.cursor(
+            dictionary=True
+        )
+
+        sql = """
+        SELECT
+            id,
+            chat_id,
+            question,
+            answer,
+            created_at
+        FROM chat_messages
+        WHERE chat_id = %s
+        ORDER BY id ASC
+        """
+
+        cursor.execute(
+            sql,
+            (chat_id,)
+        )
+
+        messages = cursor.fetchall()
+
+        return messages
+
+    finally:
+
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
